@@ -47,36 +47,43 @@
 (defmethod encode-body :json [_ body opts]
   (js/JSON.stringify (clj->js body)))
 
-(defmulti decode-body (fn [content-type bodyp opts] content-type))
+(defmulti decode-body* (fn [content-type bodyp opts] content-type))
 
-(defmethod decode-body :default [_ bodyp opts]
+(defmethod decode-body* :default [_ bodyp opts]
   (p/let [body bodyp]
-    (j/call bodyp :text)))
+         (j/call bodyp :text)))
 
-(defmethod decode-body :transit-json [_ bodyp opts]
+(defmethod decode-body* :transit-json [_ bodyp opts]
   (p/let [text (j/call bodyp :text)]
-    (let [decoded (transit/read (:transit-json-reader opts @transit-json-reader) text)]
-      (if (satisfies? IWithMeta decoded)
-        (vary-meta decoded assoc ::raw text)
-        decoded))))
+         (let [decoded (transit/read (:transit-json-reader opts @transit-json-reader) text)]
+           (if (satisfies? IWithMeta decoded)
+             (vary-meta decoded assoc ::raw text)
+             decoded))))
 
-(defmethod decode-body :json [_ bodyp opts]
+(defmethod decode-body* :json [_ bodyp opts]
   (p/let [body bodyp]
-    (j/call bodyp :json)))
+         (j/call bodyp :json)))
 
-(defn fetch-opts [{:keys [method accept content-type]
+(defn fetch-opts [{:keys [method accept content-type js-opts]
                    :or   {method       :get
-                          accept       :transit-json
-                          content-type :transit-json}}]
-  #js {:method   (str/upper-case (name method))
-       :headers  #js {"Accept"       (c/get content-types accept)
-                      "Content-Type" (c/get content-types content-type)}
-       :redirect "follow"})
+                          accept       :json
+                          content-type :json
+                          js-opts      #js {}}}]
+  (let [headers (cond-> (j/assoc! (j/get js-opts :headers) "Accept" (c/get content-types accept))
+                  ;; adding a content-type on GET can cause an odd CORS exception
+                  ;; "Redirect is not allowed for a preflight request."
+                  (not (keyword-identical? :get method))
+                  (j/assoc! "Content-Type" (c/get content-types content-type)))]
+    (j/assoc! js-opts
+              :method (str/upper-case (name method))
+              :headers headers)))
 
-(defn request [url & [{:keys [method accept content-type query-params body]
-                       :as   opts
-                       :or   {accept       :transit-json
-                              content-type :transit-json}}]]
+(defn request
+  [url & [{:keys [method accept content-type query-params body js-opts decode-body]
+           :as   opts
+           :or   {accept       :json
+                  content-type :json
+                  decode-body  decode-body*}}]]
   (let [url     (-> url
                     uri/uri
                     (assoc :query (uri/map->query-string query-params))
@@ -85,23 +92,23 @@
                   body
                   (j/assoc! :body (encode-body content-type body opts)))]
     (p/let [response (js/fetch url request)]
-      (p/try
-        (let [headers             (j/get response :headers)
-              header-map          (into {} (map vec) (es6-iterator-seq (j/call headers :entries)))
-              content-type-header (j/call headers :get "Content-Type")
-              content-type        (when content-type-header
-                                    (c/get (set/map-invert content-types)
-                                           (str/replace content-type-header #";.*" "")))]
-          (p/let [body (decode-body content-type response opts)]
-            ^{::request  (j/assoc! request :url url)
-              ::response response}
-            {:status  (j/get response :status)
-             :headers header-map
-             :body    body}))
-        (p/catch :default e
-          ^{::request  (j/assoc! request :url url)
-            ::response response}
-          {:error e})))))
+           (p/try
+             (let [headers             (j/get response :headers)
+                   header-map          (into {} (map vec) (es6-iterator-seq (j/call headers :entries)))
+                   content-type-header (j/call headers :get "Content-Type")
+                   content-type        (when content-type-header
+                                         (c/get (set/map-invert content-types)
+                                                (str/replace content-type-header #";.*" "")))]
+               (p/let [body (decode-body content-type response opts)]
+                      ^{::request  (j/assoc! request :url url)
+                        ::response response}
+                      {:status  (j/get response :status)
+                       :headers header-map
+                       :body    body}))
+             (p/catch :default e
+               ^{::request  (j/assoc! request :url url)
+                 ::response response}
+               {:error e})))))
 
 (def get request)
 
@@ -120,12 +127,30 @@
 
 (comment
   (p/let [result (get "/as400/paginated/VSBSTAMDTA.STOVKP"
-                      {:query-params {:page 1
+                      {:query-params {:page      1
                                       :page-size 20}})]
-    (def xxx result))
+         (def xxx result))
 
   (p/let [body (:body xxx)]
-    (def body body))
+         (def body body))
 
   (p/let [res (head "/as400/paginated/VSBSTAMDTA.STOVKP")]
-    (def xxx res)))
+         (def xxx res)))
+
+(comment
+  (.then (get
+           "http://noembed.com/embed"
+           {:accept       :json
+            :decode-body  (fn [_ resp _] (.json resp))
+            :query-params {:url "https://www.youtube.com/watch?v=XyNlqQId-nk"}})
+         (fn [res]
+           (js/console.log res)))
+
+  (.then (js/fetch
+           (str "http://noembed.com/embed?"
+                (uri/map->query-string {:url "https://www.youtube.com/watch?v=XyNlqQId-nk"}))
+           #js {:method  "GET"
+                :headers #js {"Accept" "application/json"
+                              ;"Content-Type" "application/json"
+                              }})
+         #(js/console.log :ret % (.then (.json %) (fn [json] (js/console.log :json json))))))
